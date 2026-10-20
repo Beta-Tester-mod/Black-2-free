@@ -1,0 +1,159 @@
+name: BLACK T36 Public Shot Stage QA
+
+# Public/synthetic only. No private repository checkout, personal logs,
+# original game XBE, Android APK build, secrets or artifact uploads.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stage-observation-qa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout PUBLIC repository only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reject known private or generated game files
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          names = [p for p in subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0') if p]
+          endings = ('.xbe','.iso','.xiso','.apk','.aab','.obb','.so','.dll',
+                     '.exe','.bin','.log','.zip','.7z','.rar','.pak','.keystore',
+                     '.jks','.pem','.key','.png','.jpg','.jpeg','.mp3','.ogg','.wav')
+          prefixes = ('private-build-input/', 'assets/', 'logs/', 'saves/', 'build/')
+          unsafe = [p for p in names if p.lower().endswith(endings) or p.lower().startswith(prefixes)]
+          if unsafe:
+              raise SystemExit('STOP: known private/binary files tracked in Public: ' + ', '.join(unsafe))
+          print('PASS: no known tracked private game or build files')
+          PY
+
+      - name: T36 conservative stage model and synthetic invariants
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import math, re, unittest
+          from collections import Counter
+          from statistics import median
+
+          STAMP = re.compile(r'^\[\s*(\d+(?:\.\d+)?)\]\s+')
+          KV = re.compile(r'([A-Za-z_][A-Za-z_0-9]*)=([^\s]+)')
+          TAGS = ('[T27 SHOT-CANDIDATE]','[T33 SHOT-CANDIDATE]',
+                  '[T33 SHOT-GEOMETRY]','[T34 SHOT-CONE]')
+          def f(x):
+              try:
+                  n = float(x)
+                  return n if math.isfinite(n) else None
+              except (ValueError, TypeError, OverflowError):
+                  return None
+          def candidate(a):
+              if a.get('selected') == '0': return 'NO_CANDIDATE_SNAPSHOT'
+              if a.get('selected') != '1': return 'UNKNOWN_SELECTION'
+              p, lim = f(a.get('candidate_param')), f(a.get('weapon_limit'))
+              if p is None or lim is None or p < 0 or lim < 0: return 'UNKNOWN_RANGE'
+              return 'OVER_LIMIT_SNAPSHOT' if p > lim else 'WITHIN_LIMIT_SNAPSHOT'
+          def geometry(a):
+              return {'1':'AL_NONZERO_SNAPSHOT', '0':'AL_ZERO_SNAPSHOT'}.get(
+                  a.get('rejected'), 'UNKNOWN_GEOMETRY')
+          def parse(s):
+              rows=[]
+              for line in s.splitlines():
+                  m=STAMP.match(line)
+                  k=next((t for t in TAGS if t in line), None)
+                  if m and k:
+                      rows.append((float(m.group(1)),k,dict(KV.findall(line.split(k,1)[1]))))
+              return rows
+          def counts(rows):
+              c=Counter()
+              for _, k, a in rows:
+                  if k == '[T33 SHOT-CANDIDATE]': c[candidate(a)]+=1
+                  if k == '[T33 SHOT-GEOMETRY]': c[geometry(a)]+=1
+              return c
+          class T36(unittest.TestCase):
+              def test_selected_within(self):
+                  self.assertEqual(candidate({'selected':'1','candidate_param':'10','weapon_limit':'25'}),'WITHIN_LIMIT_SNAPSHOT')
+              def test_selected_over(self):
+                  self.assertEqual(candidate({'selected':'1','candidate_param':'30','weapon_limit':'25'}),'OVER_LIMIT_SNAPSHOT')
+              def test_exact_boundary(self):
+                  self.assertEqual(candidate({'selected':'1','candidate_param':'25','weapon_limit':'25'}),'WITHIN_LIMIT_SNAPSHOT')
+              def test_empty_candidate(self):
+                  self.assertEqual(candidate({'selected':'0'}),'NO_CANDIDATE_SNAPSHOT')
+              def test_unknown_candidate(self):
+                  self.assertEqual(candidate({'selected':'9'}),'UNKNOWN_SELECTION')
+              def test_missing_limit(self):
+                  self.assertEqual(candidate({'selected':'1','candidate_param':'5'}),'UNKNOWN_RANGE')
+              def test_nan(self):
+                  self.assertEqual(candidate({'selected':'1','candidate_param':'nan','weapon_limit':'25'}),'UNKNOWN_RANGE')
+              def test_inf(self):
+                  self.assertEqual(candidate({'selected':'1','candidate_param':'inf','weapon_limit':'25'}),'UNKNOWN_RANGE')
+              def test_negative_sentinel(self):
+                  self.assertEqual(candidate({'selected':'1','candidate_param':'-1','weapon_limit':'25'}),'UNKNOWN_RANGE')
+              def test_geometry_rejected_flag(self):
+                  self.assertEqual(geometry({'rejected':'1'}),'AL_NONZERO_SNAPSHOT')
+              def test_geometry_zero_flag(self):
+                  self.assertEqual(geometry({'rejected':'0'}),'AL_ZERO_SNAPSHOT')
+              def test_geometry_missing_flag(self):
+                  self.assertEqual(geometry({}),'UNKNOWN_GEOMETRY')
+              def test_parse_numeric_log_keys(self):
+                  self.assertEqual(parse('[ 1.2] [T34 SHOT-CONE] boost=3 base=10 effective=30')[0][2]['base'],'10')
+              def test_noise_ignored(self):
+                  self.assertEqual(parse('random Android path /sdcard\n[T34 SHOT-CONE] boost=3'),[])
+              def test_temporal_only_not_shot_join(self):
+                  # Nearby timestamps are not proof of a single bullet.
+                  records=parse('[ 1.00] [T33 SHOT-CANDIDATE] selected=1 candidate_param=30 weapon_limit=25\n'
+                                '[ 1.01] [T33 SHOT-GEOMETRY] rejected=1\n')
+                  self.assertEqual(len(records),2)
+                  self.assertEqual(counts(records)['OVER_LIMIT_SNAPSHOT'],1)
+                  self.assertEqual(counts(records)['AL_NONZERO_SNAPSHOT'],1)
+              def test_synthetic_windows(self):
+                  data=parse('[ 10] [T33 SHOT-CANDIDATE] selected=1 candidate_param=10 weapon_limit=25\n'
+                             '[ 20] [T33 SHOT-CANDIDATE] selected=1 candidate_param=30 weapon_limit=25')
+                  self.assertEqual(counts([r for r in data if 9<=r[0]<11])['WITHIN_LIMIT_SNAPSHOT'],1)
+                  self.assertEqual(counts([r for r in data if 19<=r[0]<21])['OVER_LIMIT_SNAPSHOT'],1)
+              def test_cone_independent(self):
+                  self.assertEqual(30/10,3)
+                  self.assertEqual(60/10,6)
+                  self.assertTrue(30>25) # finding candidates does not override independent limit
+              def test_cone_finite_validation(self):
+                  self.assertIsNone(f('NaN'))
+                  self.assertIsNone(f('Infinity'))
+                  self.assertIsNone(f('x'))
+              def test_legacy_quota_warning_condition(self):
+                  data=parse('\n'.join('[ %d] [T27 SHOT-CANDIDATE] selected=0'%i for i in range(160)))
+                  self.assertEqual(len(data),160)
+              def test_no_headshot_inference(self):
+                  self.assertNotIn('HIT',candidate({'selected':'1','candidate_param':'10','weapon_limit':'25'}))
+          outcome = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(T36))
+          if not outcome.wasSuccessful(): raise SystemExit(1)
+          print('PASS: 20 synthetic tests. NOT evidence of Android accuracy or per-shot attribution.')
+          PY
+
+      - name: Clone explicitly PUBLIC original port v1.4.1
+        run: git clone --depth 1 --branch v1.4.1 https://github.com/RanggaCasper/Black-Android.git public-upstream
+
+      - name: Check original source anchors (read-only)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+          root=Path('public-upstream')
+          hooks=(root/'src/game/hooks.cpp').read_text(encoding='utf-8')
+          layout=(root/'src/game/layout.h').read_text(encoding='utf-8')
+          mouse=(root/'src/game/mouse.cpp').read_text(encoding='utf-8')
+          cfg=tomllib.loads((root/'config/game.toml').read_text(encoding='utf-8'))
+          assert 'static uint32_t Player() { return R32(kWorld) + kWorldPlayer; }' in hooks
+          assert 'constexpr uint32_t kPlayerWeapon = 0x29C;' in hooks
+          assert 'constexpr uint32_t kWeaponData = 0xEC;' in hooks
+          assert 'constexpr uint32_t kWorldPlayer = 0x30;' in layout
+          assert 'bool AimAssist(' in mouse
+          assert sum(h.get('at') == 0x1DCDAB and h.get('call') == 'AimAssist' for h in cfg['hook']) == 1
+          print('PASS: original v1.4.1 public source offsets and hook anchors present')
+          print('T33/T34 hooks are PRIVATE overlays and are not tested by this PUBLIC job')
+          PY
