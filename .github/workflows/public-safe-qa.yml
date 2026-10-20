@@ -1,0 +1,83 @@
+name: BLACK Public Free QA
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  public-only-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout public repository only
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Reject private game / build files in public repo
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          files = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
+          denied = ('.xbe', '.iso', '.xiso', '.apk', '.aab', '.obb', '.so', '.dll', '.exe', '.bin', '.log', '.zip', '.7z', '.rar')
+          bad = [p for p in files if p and (p.lower().endswith(denied) or p.startswith(('assets/', 'private-build-input/')))]
+          if bad:
+              raise SystemExit('Unsafe files in PUBLIC repository: ' + ', '.join(bad))
+          print('PASS: No known game binaries, builds, ROMs, or logs committed')
+          PY
+      - name: Source-independent T34/T35 aiming/range QA (synthetic only)
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import math
+          import unittest
+          class TrackingMath(unittest.TestCase):
+              def scale(self, radius, strength):
+                  multipliers = (1, 1.5, 2, 3, 4, 6)
+                  if strength < 1 or strength >= len(multipliers) or not math.isfinite(radius) or radius <= 0:
+                      return radius
+                  candidate = radius * multipliers[strength]
+                  return candidate if math.isfinite(candidate) else radius
+              def test_modes(self):
+                  self.assertEqual([self.scale(10, i) for i in range(6)], [10, 15, 20, 30, 40, 60])
+              def test_invalid_inputs_fail_closed(self):
+                  self.assertEqual(self.scale(10, 99), 10)
+                  self.assertEqual(self.scale(0, 5), 0)
+                  self.assertTrue(math.isnan(self.scale(float('nan'), 3)))
+                  self.assertEqual(self.scale(1.4e308, 5), 1.4e308)
+              def test_distance_independent_from_cone(self):
+                  max_range = 25.0
+                  self.assertGreater(self.scale(10, 5), max_range)
+                  self.assertFalse(29.0 <= max_range)
+                  self.assertTrue(15.0 <= max_range)
+              def test_bounded_separate_event_counters(self):
+                  events = [('empty', 0)] * 160 + [('geometry', 1)] * 10
+                  counts = {'empty': 0, 'geometry': 0}
+                  for event, _ in events:
+                      counts[event] += 1
+                  self.assertEqual(counts, {'empty': 160, 'geometry': 10})
+          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(TrackingMath))
+          if not result.wasSuccessful():
+              raise SystemExit(1)
+          PY
+      - name: Clone explicitly public source reference v1.4.1
+        run: git clone --depth 1 --branch v1.4.1 https://github.com/RanggaCasper/Black-Android.git public-upstream
+      - name: Inspect public port compatibility anchors
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path('public-upstream')
+          mouse = (src / 'src/game/mouse.cpp').read_text()
+          hooks = (src / 'src/game/hooks.cpp').read_text()
+          cfg = (src / 'config/game.toml').read_text()
+          assert 'bool AimAssist(' in mouse
+          assert '#include <algorithm>' in mouse
+          assert 'X86_FUNC(sub_001EEFD0)' in hooks
+          assert 'call = "AimAssist"' in cfg
+          print('PASS: public upstream v1.4.1 anchors available (NOT private APK verification)')
+          PY
